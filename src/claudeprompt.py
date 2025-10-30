@@ -6,6 +6,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 import torch
+from torch._higher_order_ops.while_loop import while_loop_func
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
@@ -50,6 +51,11 @@ class MEMSDataset(Dataset):
         }
 
 
+# MEMSLSTMModel: 4.04M trainable params
+#     Sequential: 17.22K trainable params
+#     LSTM: 3.82M trainable params
+#     Sequential: 131.59K trainable params
+#     Sequential: 74.05K trainable params
 class MEMSLSTMModel(nn.Module):
     """LSTM model for MEMS displacement prediction"""
 
