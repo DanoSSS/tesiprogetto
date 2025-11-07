@@ -272,14 +272,16 @@ def train_epoch(
     train_loader: DataLoader,
     criterion,
     optimizer,
-    device: str
+    device: str,
+    verbose: bool = True
 ) -> float:
     """Train for one epoch and return average loss"""
 
     model.train()
     total_loss = 0.0
+    num_batches = len(train_loader)
 
-    for X_seq, y_target, features in train_loader:
+    for batch_idx, (X_seq, y_target, features) in enumerate(train_loader):
         # Move data to device
         X_seq = X_seq.to(device)
         y_target = y_target.to(device)
@@ -289,12 +291,24 @@ def train_epoch(
         predictions = model(X_seq, features)
         loss = criterion(predictions, y_target)
 
+        # Check for NaN/Inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"WARNING: Loss is NaN/Inf at batch {batch_idx}")
+            print(f"  Predictions stats: min={predictions.min():.4f}, max={predictions.max():.4f}, mean={predictions.mean():.4f}")
+            print(f"  Targets stats: min={y_target.min():.4f}, max={y_target.max():.4f}, mean={y_target.mean():.4f}")
+            continue
+
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
+
+        # Progress indicator every 10 batches
+        if verbose and (batch_idx + 1) % max(1, num_batches // 10) == 0:
+            avg_loss = total_loss / (batch_idx + 1)
+            print(f"    Batch [{batch_idx+1}/{num_batches}] | Loss: {loss.item():.6f} | Avg: {avg_loss:.6f}")
 
     return total_loss / len(train_loader)
 
@@ -349,19 +363,19 @@ def train_model(
 
     for epoch in range(num_epochs):
         # Train
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        print(f"\n  Epoch [{epoch+1}/{num_epochs}] - Training...")
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, verbose=True)
         train_losses.append(train_loss)
 
         # Validate
+        print(f"  Epoch [{epoch+1}/{num_epochs}] - Validating...")
         val_loss = validate(model, val_loader, criterion, device)
         val_losses.append(val_loss)
 
         # Learning rate scheduling
         scheduler.step(val_loss)
 
-        if (epoch + 1) % 5 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}] | "
-                  f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
     return train_losses, val_losses
 
@@ -487,9 +501,10 @@ def main():
     print("="*70)
 
     # Configuration
-    DATA_DIR = r"D:\exportfiles"  # Point to your actual COMSOL export directory
+    DATA_DIR = "D:/exportfiles"  # Point to your actual COMSOL export directory
     BATCH_SIZE = 16
     SEQUENCE_LENGTH = 10
+    STRIDE = 10  # Increased from 5 to reduce number of overlapping sequences
     HIDDEN_SIZE = 32
     NUM_EPOCHS = 30
     LEARNING_RATE = 0.001
@@ -502,7 +517,7 @@ def main():
     # Step 1: Load and prepare data
     # -----------------------------------------------------------------------
     print("\n[Step 1] Loading dataset...")
-    dataset = SimpleBeamDataset(DATA_DIR, sequence_length=SEQUENCE_LENGTH, stride=5)
+    dataset = SimpleBeamDataset(DATA_DIR, sequence_length=SEQUENCE_LENGTH, stride=STRIDE)
 
     if len(dataset) == 0:
         print("ERROR: No data loaded!")
