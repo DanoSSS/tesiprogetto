@@ -21,12 +21,8 @@ anaconda_projects
 thesiswiki
 diary
 sample
-FILES_CREATED.txt
-QUICK_START.txt
-START_HERE.md
-SUMMARY.txt
-TESTING_GUIDE.md
-src/CLAUDE.md
-src/SIMPLE_LSTM_GUIDE.md
-src/README_SIMPLE_LSTM.md
-src/.claude
+__pycache__/
+sessiontesipy.vim
+src/__pycache__/
+saved_models*
+results

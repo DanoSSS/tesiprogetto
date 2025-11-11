@@ -1,127 +1,88 @@
 """
-LSTM Ensemble System for MEMS Beam Displacement Prediction
-===========================================================
+LSTM Ensemble for MEMS Beam Displacement Prediction
 
-Sistema LSTM con meccanismo di attenzione per previsione spostamento verticale
-di trave incastrata-incastrata da simulazioni COMSOL con attuazione elettrica
-periodica (wave) e a gradino (step).
+Separate models for wave (sinusoidal) and step voltage actuation.
+Each uses a 2-layer LSTM (96 hidden units) with scaled dot-product attention.
 
-Architecture:
-- Separate models trained on wave and step actuation types
-- Each model uses attention mechanism for improved temporal awareness
-- Features integration: geometric parameters (beam_length, beam_height, air_gap)
-- Output: 2 displacement predictions (mid-span and 3/4-span)
+Handles:
+- Data loading from COMSOL simulations
+- Preprocessing and normalization
+- Training with validation monitoring
+- Model persistence and inference
 
-Author: Claude Code
-Date: 2025
+Italian: Sistema di ensemble LSTM per la previsione dello spostamento
+di travi MEMS soggette ad attuazione elettrostatica periodica (wave) e a gradino (step).
 """
 
 import glob
 import os
-from typing import Dict, List, Optional, Tuple
-import warnings
-
-import matplotlib.pyplot as plt
+import pickle
+from typing import Dict, List
 import numpy as np
 import pandas as pd
-from scipy import signal
-from scipy.fft import fft, fftfreq
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, Dataset
 
 
 class BeamDataset(Dataset):
-    """
-    Custom dataset for COMSOL beam displacement data.
-
-    Handles loading and preprocessing of vertical displacement time-series
-    with geometric parameters and actuation type information.
-
-    Data Loading Behavior:
-    - 'wave': Loads ONLY vertdisptime_*.txt files (sinusoidal actuation)
-    - 'step': Loads ONLY stepvertdisptime_*.txt files (step actuation)
-    - 'both': Loads both file types separately
-    """
+    """Load COMSOL displacement data and create time-series samples."""
 
     def __init__(self, data_dir: str, actuation_type: str = 'both',
-                 sequence_length: int = 50, stride: int = 10):
+                 sequence_length: int = 30, stride: int = 10):
         """
         Args:
-            data_dir: Directory containing .txt files
-            actuation_type: 'wave' (vertdisptime_*.txt only),
-                           'step' (stepvertdisptime_*.txt only),
-                           or 'both' (both file types)
-            sequence_length: Length of temporal sequences
-            stride: Step size for creating overlapping sequences
-
-        File Naming Convention:
-            Wave files:  vertdisptime_*.txt
-            Step files:  stepvertdisptime_*.txt
+            data_dir: Directory with simulation data files
+            actuation_type: 'wave', 'step', or 'both'
+            sequence_length: Sliding window size
+            stride: Window step size
         """
         self.data_dir = data_dir
         self.actuation_type = actuation_type
         self.sequence_length = sequence_length
         self.stride = stride
 
-        # Scalers for normalization
-        self.input_scaler = StandardScaler()
-        self.output_scaler = StandardScaler()
+        # Data normalization
+        from sklearn.preprocessing import MinMaxScaler, StandardScaler
+        self.input_scaler = MinMaxScaler(feature_range=(0, 1))
+        self.output_scaler = MinMaxScaler(feature_range=(0, 1))
         self.geom_scaler = StandardScaler()
 
-        # Load and preprocess data
         self.load_data()
 
     def load_data(self):
-        """Load and preprocess data from COMSOL files"""
+        """Load and preprocess COMSOL data files."""
         all_sequences = []
         all_targets = []
         all_geom_features = []
         all_voltage_info = []
 
-        # Define file patterns based on actuation type
+        # Determine which files to load
         if self.actuation_type == 'wave':
-            # Wave actuation: load ONLY vertdisptime_*.txt files (exclude step files)
-            pattern = 'vertdisptime_*.txt'
-            print(f"\nLoading WAVE actuation data from: {pattern}")
+            patterns = ['vertdisptime_*.txt']
+            print(f"\nLoading WAVE actuation files...")
         elif self.actuation_type == 'step':
-            # Step actuation: load ONLY stepvertdisptime_*.txt files (exclude wave files)
-            pattern = 'stepvertdisptime_*.txt'
-            print(f"\nLoading STEP actuation data from: {pattern}")
-        else:  # both
-            # Both: load wave and step separately for clarity
-            pattern = None
-            print(f"\nLoading BOTH wave and step actuation data")
+            patterns = ['stepvertdisptime_*.txt']
+            print(f"\nLoading STEP actuation files...")
+        else:
+            patterns = ['vertdisptime_*.txt', 'stepvertdisptime_*.txt']
+            print(f"\nLoading BOTH wave and step actuation files...")
 
-        # Load displacement files
-        if pattern:
-            # Single pattern for wave or step
+        # Process each file pattern
+        for pattern in patterns:
             files = glob.glob(os.path.join(self.data_dir, pattern))
-            print(f"Found {len(files)} files matching pattern: {pattern}")
+            print(f"Found {len(files)} files for pattern: {pattern}")
 
-            for file in files:
+            for file_path in files:
                 try:
-                    self._process_file(file, all_sequences, all_targets,
+                    self._process_file(file_path, all_sequences, all_targets,
                                      all_geom_features, all_voltage_info)
                 except Exception as e:
-                    print(f"Error loading {file}: {e}")
+                    print(f"Skipping {file_path}: {e}")
                     continue
-        else:
-            # Load both wave and step separately for 'both' mode
-            for pattern in ['vertdisptime_*.txt', 'stepvertdisptime_*.txt']:
-                files = glob.glob(os.path.join(self.data_dir, pattern))
-                print(f"Found {len(files)} files matching pattern: {pattern}")
-
-                for file in files:
-                    try:
-                        self._process_file(file, all_sequences, all_targets,
-                                         all_geom_features, all_voltage_info)
-                    except Exception as e:
-                        print(f"Error loading {file}: {e}")
-                        continue
 
         # Convert to numpy arrays
         if all_sequences:
@@ -129,42 +90,28 @@ class BeamDataset(Dataset):
             self.targets = np.array(all_targets)
             self.geom_features = np.array(all_geom_features)
             self.voltage_info = np.array(all_voltage_info) if all_voltage_info else None
+            print(f"Loaded {len(self.sequences)} samples")
 
-            print(f"Loaded {len(self.sequences)} sequences")
-
-            # Normalize data
             self._normalize_data()
         else:
-            print("Warning: No sequences loaded!")
+            print("WARNING: No data loaded!")
             self.sequences = np.empty((0, self.sequence_length, 2))
             self.targets = np.empty((0, 2))
             self.geom_features = np.empty((0, 3))
             self.voltage_info = None
 
-    def _process_file(self, file_path: str, all_sequences: List, all_targets: List,
-                     all_geom_features: List, all_voltage_info: List):
-        """
-        Process a single displacement file.
-
-        Expected format:
-        Column 0: Vbase (voltage or param)
-        Column 1: beam_length (b_len)
-        Column 2: beam_height (b_height)
-        Column 3: air_gap
-        Column 4: time
-        Column 5: displacement_mid (L/2)
-        Column 6: displacement_3/4 (3L/4)
-        """
+    def _process_file(self, file_path: str, all_sequences, all_targets,
+                     all_geom_features, all_voltage_info):
+        """Process a single COMSOL output file."""
         data = pd.read_csv(file_path, sep=r'\s+', header=None)
 
         if data.shape[1] < 7:
-            print(f"Skipping {file_path}: insufficient columns")
-            return
+            raise ValueError(f"File has {data.shape[1]} columns, need at least 7")
 
-        # Extract geometric parameters and voltage info
+        # Extract geometry and voltage
         vbase = data.iloc[0, 0]
-        b_len = data.iloc[0, 1]
-        b_height = data.iloc[0, 2]
+        beam_len = data.iloc[0, 1]
+        beam_height = data.iloc[0, 2]
         air_gap = data.iloc[0, 3]
 
         # Extract time series
@@ -172,38 +119,44 @@ class BeamDataset(Dataset):
         disp_mid = data.iloc[:, 5].values
         disp_3q = data.iloc[:, 6].values
 
-        # Create sliding window sequences
+        # Use only first period (T_0 = 10 µs = 500 samples @ 50 MHz)
+        samples_per_period = 500
+        if len(time) < samples_per_period:
+            raise ValueError(f"Not enough samples: {len(time)} < {samples_per_period}")
+
+        time = time[:samples_per_period]
+        disp_mid = disp_mid[:samples_per_period]
+        disp_3q = disp_3q[:samples_per_period]
+
+        # Create sliding windows
         for i in range(0, len(time) - self.sequence_length, self.stride):
-            seq_time = time[i:i+self.sequence_length]
-            seq_disp_mid = disp_mid[i:i+self.sequence_length]
-            seq_disp_3q = disp_3q[i:i+self.sequence_length]
+            seq = np.column_stack([
+                disp_mid[i:i+self.sequence_length],
+                disp_3q[i:i+self.sequence_length]
+            ])
+            all_sequences.append(seq)
 
-            # Combine displacements as input (seq_len, 2)
-            sequence = np.column_stack([seq_disp_mid, seq_disp_3q])
-            all_sequences.append(sequence)
-
-            # Target: next displacement values
             if i + self.sequence_length < len(time):
                 target = np.array([
                     disp_mid[i+self.sequence_length],
                     disp_3q[i+self.sequence_length]
                 ])
                 all_targets.append(target)
-                all_geom_features.append([b_len, b_height, air_gap])
+                all_geom_features.append([beam_len, beam_height, air_gap])
                 all_voltage_info.append(vbase)
 
     def _normalize_data(self):
-        """Normalize sequences, targets, and geometric features"""
-        # Normalize input sequences
-        seq_shape = self.sequences.shape
-        self.sequences = self.sequences.reshape(-1, seq_shape[-1])
+        """Normalize sequences, targets, and features."""
+        # Reshape and normalize inputs
+        shape = self.sequences.shape
+        self.sequences = self.sequences.reshape(-1, shape[-1])
         self.sequences = self.input_scaler.fit_transform(self.sequences)
-        self.sequences = self.sequences.reshape(seq_shape)
+        self.sequences = self.sequences.reshape(shape)
 
-        # Normalize output targets
+        # Normalize targets
         self.targets = self.output_scaler.fit_transform(self.targets)
 
-        # Normalize geometric features
+        # Normalize geometry
         self.geom_features = self.geom_scaler.fit_transform(self.geom_features)
 
     def __len__(self):
@@ -216,76 +169,46 @@ class BeamDataset(Dataset):
 
 
 class AttentionLayer(nn.Module):
-    """Scaled dot-product attention mechanism"""
+    """Scaled dot-product attention."""
 
     def __init__(self, hidden_size: int):
-        super(AttentionLayer, self).__init__()
+        super().__init__()
         self.query = nn.Linear(hidden_size, hidden_size)
         self.key = nn.Linear(hidden_size, hidden_size)
         self.value = nn.Linear(hidden_size, hidden_size)
         self.scale = np.sqrt(hidden_size)
 
-    def forward(self, lstm_output):
-        """
-        Args:
-            lstm_output: (batch, seq_len, hidden_size)
-        Returns:
-            context: (batch, hidden_size)
-            attention_weights: (batch, seq_len)
-        """
-        Q = self.query(lstm_output)  # (batch, seq_len, hidden_size)
-        K = self.key(lstm_output)
-        V = self.value(lstm_output)
+    def forward(self, lstm_out):
+        """Apply attention to LSTM outputs."""
+        Q = self.query(lstm_out)
+        K = self.key(lstm_out)
+        V = self.value(lstm_out)
 
-        # Attention scores
+        # Compute attention scores
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        attention_weights = torch.softmax(scores, dim=-1)
+        weights = torch.softmax(scores, dim=-1)
 
-        # Apply attention to values
-        context = torch.matmul(attention_weights, V)  # (batch, seq_len, hidden_size)
-        context = context[:, -1, :]  # Take last time step (batch, hidden_size)
-
-        return context, attention_weights
+        # Apply to values, take last timestep
+        context = torch.matmul(weights, V)[:, -1, :]
+        return context, weights
 
 
 class AttentionBeamLSTM(nn.Module):
-    """
-    LSTM with attention mechanism for beam displacement prediction.
+    """LSTM with attention for beam displacement prediction."""
 
-    Architecture:
-    1. Bidirectional LSTM to capture temporal patterns
-    2. Scaled dot-product attention to focus on important time steps
-    3. Feature encoder for geometric parameters
-    4. Output network combining LSTM context and features
-    """
-
-    def __init__(self, input_size: int = 2, hidden_size: int = 128,
+    def __init__(self, input_size: int = 2, hidden_size: int = 96,
                  num_layers: int = 2, output_size: int = 2,
                  feature_size: int = 3, dropout: float = 0.2):
-        """
-        Args:
-            input_size: Input dimension (disp_mid, disp_3q)
-            hidden_size: LSTM hidden state dimension
-            num_layers: Number of LSTM layers
-            output_size: Output dimension (2 displacements)
-            feature_size: Geometric features dimension
-            dropout: Dropout rate
-        """
-        super(AttentionBeamLSTM, self).__init__()
+        super().__init__()
 
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-        # Bidirectional LSTM
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
                            batch_first=True,
                            dropout=dropout if num_layers > 1 else 0,
                            bidirectional=False)
 
-        # Attention mechanism
         self.attention = AttentionLayer(hidden_size)
 
-        # Feature encoder
+        # Encode geometric features
         self.feature_encoder = nn.Sequential(
             nn.Linear(feature_size, 64),
             nn.ReLU(),
@@ -306,57 +229,32 @@ class AttentionBeamLSTM(nn.Module):
         )
 
     def forward(self, x, features=None):
-        """
-        Forward pass.
-
-        Args:
-            x: Input sequences (batch, seq_len, input_size)
-            features: Geometric features (batch, feature_size)
-
-        Returns:
-            output: Predictions (batch, output_size)
-        """
-        # LSTM processing
-        lstm_out, (h_n, c_n) = self.lstm(x)
-
-        # Apply attention
+        # LSTM pass
+        lstm_out, _ = self.lstm(x)
         context, _ = self.attention(lstm_out)
 
-        # Process features
+        # Combine with features
         if features is not None:
-            encoded_features = self.feature_encoder(features)
-            combined = torch.cat([context, encoded_features], dim=1)
+            feat_encoded = self.feature_encoder(features)
+            combined = torch.cat([context, feat_encoded], dim=1)
         else:
             combined = context
 
-        # Output prediction
-        output = self.output_net(combined)
-
-        return output
+        return self.output_net(combined)
 
 
 class EnsembleBeamPredictor:
-    """
-    Ensemble system managing separate models for different actuation types.
-
-    Maintains independent models for 'wave' and 'step' actuation, allowing
-    specialized learning for each type of electrical driving.
-    """
+    """Manage separate models for wave and step actuation."""
 
     def __init__(self, model_configs: Dict = None):
-        """
-        Args:
-            model_configs: Configuration for each model type
-        """
         self.models = {}
-        self.scalers = {}
         self.model_configs = model_configs or {
-            'wave': {'hidden_size': 128, 'num_layers': 2, 'dropout': 0.2},
-            'step': {'hidden_size': 128, 'num_layers': 2, 'dropout': 0.2}
+            'wave': {'hidden_size': 96, 'num_layers': 2, 'dropout': 0.2},
+            'step': {'hidden_size': 96, 'num_layers': 2, 'dropout': 0.2}
         }
 
     def create_models(self):
-        """Create LSTM models for each actuation type"""
+        """Create a model for each actuation type."""
         for name, config in self.model_configs.items():
             model = AttentionBeamLSTM(
                 input_size=2,
@@ -367,26 +265,20 @@ class EnsembleBeamPredictor:
                 dropout=config.get('dropout', 0.2)
             )
             self.models[name] = model
-            print(f"Created model for '{name}' actuation type")
+            print(f"Created model for '{name}' actuation")
 
     def train_model(self, model_name: str, train_loader: DataLoader,
-                   val_loader: DataLoader, epochs: int = 100,
+                   val_loader: DataLoader, epochs: int = 80,
                    learning_rate: float = 0.001, device: str = 'cpu'):
-        """
-        Train a single model.
+        """Train a single model."""
+        if isinstance(device, str):
+            device = torch.device(device)
 
-        Args:
-            model_name: Name of the model ('wave' or 'step')
-            train_loader: Training data loader
-            val_loader: Validation data loader
-            epochs: Number of training epochs
-            learning_rate: Initial learning rate
-            device: 'cpu' or 'cuda'
+        if device.type == 'cuda':
+            print(f"\n  GPU: {torch.cuda.get_device_name(device.index)}")
+            mem_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+            print(f"  GPU Memory: {mem_gb:.2f} GB")
 
-        Returns:
-            train_losses: List of training losses per epoch
-            val_losses: List of validation losses per epoch
-        """
         model = self.models[model_name].to(device)
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -394,379 +286,408 @@ class EnsembleBeamPredictor:
             optimizer, mode='min', factor=0.5, patience=10
         )
 
+        scaler = GradScaler('cuda') if device.type == 'cuda' else None
+
         train_losses = []
         val_losses = []
 
         for epoch in range(epochs):
-            # Training phase
+            # Training
             model.train()
             train_loss = 0.0
-            for sequences, targets, features in train_loader:
-                sequences = sequences.to(device)
-                targets = targets.to(device)
-                features = features.to(device)
+            n_batches = 0
+
+            for seq, target, feat in train_loader:
+                seq = seq.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                feat = feat.to(device, non_blocking=True)
 
                 optimizer.zero_grad()
-                outputs = model(sequences, features)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
+
+                if device.type == 'cuda':
+                    with autocast('cuda'):
+                        out = model(seq, feat)
+                        loss = criterion(out, target)
+                    scaler.scale(loss).backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    out = model(seq, feat)
+                    loss = criterion(out, target)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
 
                 train_loss += loss.item()
+                n_batches += 1
 
-            # Validation phase
+                if device.type == 'cuda' and n_batches % 10 == 0:
+                    torch.cuda.empty_cache()
+
+            # Validation
             model.eval()
             val_loss = 0.0
             with torch.no_grad():
-                for sequences, targets, features in val_loader:
-                    sequences = sequences.to(device)
-                    targets = targets.to(device)
-                    features = features.to(device)
+                for seq, target, feat in val_loader:
+                    seq = seq.to(device, non_blocking=True)
+                    target = target.to(device, non_blocking=True)
+                    feat = feat.to(device, non_blocking=True)
 
-                    outputs = model(sequences, features)
-                    loss = criterion(outputs, targets)
+                    if device.type == 'cuda':
+                        with autocast('cuda'):
+                            out = model(seq, feat)
+                            loss = criterion(out, target)
+                    else:
+                        out = model(seq, feat)
+                        loss = criterion(out, target)
                     val_loss += loss.item()
 
-            avg_train_loss = train_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
+            avg_train = train_loss / len(train_loader)
+            avg_val = val_loss / len(val_loader)
 
-            train_losses.append(avg_train_loss)
-            val_losses.append(avg_val_loss)
+            train_losses.append(avg_train)
+            val_losses.append(avg_val)
 
-            scheduler.step(avg_val_loss)
+            scheduler.step(avg_val)
 
             if (epoch + 1) % 10 == 0:
-                print(f"[{model_name}] Epoch [{epoch+1}/{epochs}] | "
-                      f"Train Loss: {avg_train_loss:.6f} | "
-                      f"Val Loss: {avg_val_loss:.6f}")
+                gpu_info = ""
+                if device.type == 'cuda':
+                    mem = torch.cuda.memory_allocated(device) / 1e9
+                    gpu_info = f" | GPU: {mem:.2f} GB"
+                print(f"[{model_name}] Epoch {epoch+1}/{epochs} | "
+                      f"Train: {avg_train:.6f} | Val: {avg_val:.6f}{gpu_info}")
+
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         return train_losses, val_losses
 
     def predict(self, sequences: torch.Tensor, features: torch.Tensor,
                actuation_type: str = 'wave', device: str = 'cpu') -> np.ndarray:
-        """
-        Make predictions using the appropriate model.
-
-        Args:
-            sequences: Input sequences (batch, seq_len, 2)
-            features: Geometric features (batch, 3)
-            actuation_type: 'wave' or 'step'
-            device: 'cpu' or 'cuda'
-
-        Returns:
-            predictions: numpy array of shape (batch, 2)
-        """
+        """Make predictions with the appropriate model."""
         if actuation_type not in self.models:
-            print(f"Model '{actuation_type}' not found. Using 'wave'.")
+            print(f"Model '{actuation_type}' not found, using 'wave'")
             actuation_type = 'wave'
 
-        model = self.models[actuation_type].to(device)
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        model = self.models[actuation_type]
+        if next(model.parameters()).device != device:
+            model = model.to(device)
+            self.models[actuation_type] = model
         model.eval()
 
-        with torch.no_grad():
-            predictions = model(sequences.to(device), features.to(device))
+        # Convert to tensors if needed
+        if isinstance(sequences, np.ndarray):
+            sequences = torch.FloatTensor(sequences)
+        if isinstance(features, np.ndarray):
+            features = torch.FloatTensor(features)
 
-        return predictions.cpu().numpy()
+        sequences = sequences.to(device)
+        features = features.to(device)
+
+        with torch.no_grad():
+            predictions = model(sequences, features)
+
+        result = predictions.cpu().detach().numpy()
+
+        if device.type == 'cuda':
+            del sequences, features, predictions
+            torch.cuda.empty_cache()
+
+        return result
 
     def save_models(self, save_dir: str):
-        """Save all models to directory"""
+        """Save all models."""
         os.makedirs(save_dir, exist_ok=True)
         for name, model in self.models.items():
             checkpoint = {
-                'model_state_dict': model.state_dict(),
-                'model_config': self.model_configs[name]
+                'state_dict': model.state_dict(),
+                'config': self.model_configs[name]
             }
-            torch.save(checkpoint, os.path.join(save_dir, f'{name}_model.pt'))
-            print(f"Saved {name} model to {save_dir}")
+            path = os.path.join(save_dir, f'{name}_model.pt')
+            torch.save(checkpoint, path)
+            print(f"Saved {name} model to {path}")
+
+    def save_scalers(self, save_dir: str):
+        """Save normalization scalers."""
+        os.makedirs(save_dir, exist_ok=True)
+
+        if hasattr(self, '_input_scaler') and self._input_scaler:
+            with open(os.path.join(save_dir, 'input_scaler.pkl'), 'wb') as f:
+                pickle.dump(self._input_scaler, f)
+            print(f"Saved input_scaler")
+
+        if hasattr(self, '_output_scaler') and self._output_scaler:
+            with open(os.path.join(save_dir, 'output_scaler.pkl'), 'wb') as f:
+                pickle.dump(self._output_scaler, f)
+            print(f"Saved output_scaler")
+
+        if hasattr(self, '_geom_scaler') and self._geom_scaler:
+            with open(os.path.join(save_dir, 'geom_scaler.pkl'), 'wb') as f:
+                pickle.dump(self._geom_scaler, f)
+            print(f"Saved geom_scaler")
 
     def load_models(self, save_dir: str):
-        """Load models from directory"""
+        """Load saved models."""
         for name in self.model_configs.keys():
             path = os.path.join(save_dir, f'{name}_model.pt')
             if os.path.exists(path):
                 checkpoint = torch.load(path, map_location='cpu')
                 model = AttentionBeamLSTM(
-                    hidden_size=checkpoint['model_config']['hidden_size'],
-                    num_layers=checkpoint['model_config']['num_layers'],
-                    dropout=checkpoint['model_config'].get('dropout', 0.2)
+                    hidden_size=checkpoint['config']['hidden_size'],
+                    num_layers=checkpoint['config']['num_layers'],
+                    dropout=checkpoint['config'].get('dropout', 0.2)
                 )
-                model.load_state_dict(checkpoint['model_state_dict'])
+                model.load_state_dict(checkpoint['state_dict'])
                 self.models[name] = model
-                print(f"Loaded {name} model from {save_dir}")
+                print(f"Loaded {name} model")
             else:
-                print(f"Warning: Model file {path} not found")
+                print(f"Model file not found: {path}")
 
 
-def visualize_training(train_losses: List, val_losses: List, title: str,
-                      save_path: str = None):
-    """Visualize training curves with publication quality"""
+def plot_training(train_losses, val_losses, title, save_path=None):
+    """Plot training curves."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Linear scale
-    axes[0].plot(train_losses, label='Training Loss', linewidth=2.5, marker='o', markersize=4)
-    axes[0].plot(val_losses, label='Validation Loss', linewidth=2.5, marker='s', markersize=4)
-    axes[0].set_xlabel('Epoch', fontsize=12, fontweight='bold')
-    axes[0].set_ylabel('Loss (MSE)', fontsize=12, fontweight='bold')
-    axes[0].set_title(f'{title} - Linear Scale', fontsize=13, fontweight='bold')
-    axes[0].legend(fontsize=11)
-    axes[0].grid(True, alpha=0.3)
+    axes[0].plot(train_losses, label='Training', linewidth=2.5)
+    axes[0].plot(val_losses, label='Validation', linewidth=2.5)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss (MSE)', fontsize=12)
+    axes[0].set_title(f'{title} - Linear', fontsize=12)
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
 
     # Log scale
-    axes[1].semilogy(train_losses, label='Training Loss', linewidth=2.5, marker='o', markersize=4)
-    axes[1].semilogy(val_losses, label='Validation Loss', linewidth=2.5, marker='s', markersize=4)
-    axes[1].set_xlabel('Epoch', fontsize=12, fontweight='bold')
-    axes[1].set_ylabel('Loss (MSE) - Log Scale', fontsize=12, fontweight='bold')
-    axes[1].set_title(f'{title} - Log Scale', fontsize=13, fontweight='bold')
-    axes[1].legend(fontsize=11)
-    axes[1].grid(True, alpha=0.3, which='both')
+    axes[1].semilogy(train_losses, label='Training', linewidth=2.5)
+    axes[1].semilogy(val_losses, label='Validation', linewidth=2.5)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Loss (MSE)', fontsize=12)
+    axes[1].set_title(f'{title} - Log', fontsize=12)
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
 
-    plt.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
-
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved training plot to {save_path}")
-
+        print(f"Saved plot to {save_path}")
     plt.show()
 
 
-def visualize_predictions(true_values: np.ndarray, predictions: np.ndarray,
-                         title: str = "Predictions", save_path: str = None):
-    """Visualize prediction quality with publication-quality plots"""
+def plot_predictions(true_vals, pred_vals, title="Predictions", save_path=None):
+    """Plot actual vs predicted values."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # Mid-span displacement: scatter
-    axes[0, 0].scatter(true_values[:, 0], predictions[:, 0], alpha=0.6, s=20)
-    min_val, max_val = true_values[:, 0].min(), true_values[:, 0].max()
-    axes[0, 0].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect prediction')
-    axes[0, 0].set_xlabel('True Displacement (µm)', fontsize=11, fontweight='bold')
-    axes[0, 0].set_ylabel('Predicted Displacement (µm)', fontsize=11, fontweight='bold')
-    axes[0, 0].set_title('Mid-span Displacement (L/2)', fontsize=12, fontweight='bold')
-    axes[0, 0].legend(fontsize=10)
-    axes[0, 0].grid(True, alpha=0.3)
+    # Mid-span scatter
+    axes[0, 0].scatter(true_vals[:, 0], pred_vals[:, 0], alpha=0.6, s=20)
+    min_v, max_v = true_vals[:, 0].min(), true_vals[:, 0].max()
+    axes[0, 0].plot([min_v, max_v], [min_v, max_v], 'r--', linewidth=2)
+    axes[0, 0].set_xlabel('True (µm)', fontsize=11)
+    axes[0, 0].set_ylabel('Predicted (µm)', fontsize=11)
+    axes[0, 0].set_title('Mid-span', fontsize=12)
+    axes[0, 0].grid(alpha=0.3)
 
-    # 3/4-span displacement: scatter
-    axes[0, 1].scatter(true_values[:, 1], predictions[:, 1], alpha=0.6, s=20, color='orange')
-    min_val, max_val = true_values[:, 1].min(), true_values[:, 1].max()
-    axes[0, 1].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect prediction')
-    axes[0, 1].set_xlabel('True Displacement (µm)', fontsize=11, fontweight='bold')
-    axes[0, 1].set_ylabel('Predicted Displacement (µm)', fontsize=11, fontweight='bold')
-    axes[0, 1].set_title('3/4-span Displacement (3L/4)', fontsize=12, fontweight='bold')
-    axes[0, 1].legend(fontsize=10)
-    axes[0, 1].grid(True, alpha=0.3)
+    # 3/4-span scatter
+    axes[0, 1].scatter(true_vals[:, 1], pred_vals[:, 1], alpha=0.6, s=20, color='orange')
+    min_v, max_v = true_vals[:, 1].min(), true_vals[:, 1].max()
+    axes[0, 1].plot([min_v, max_v], [min_v, max_v], 'r--', linewidth=2)
+    axes[0, 1].set_xlabel('True (µm)', fontsize=11)
+    axes[0, 1].set_ylabel('Predicted (µm)', fontsize=11)
+    axes[0, 1].set_title('3/4-span', fontsize=12)
+    axes[0, 1].grid(alpha=0.3)
 
-    # Errors over time
-    errors_mid = np.abs(true_values[:, 0] - predictions[:, 0])
-    axes[1, 0].plot(errors_mid, linewidth=1.5, color='blue', alpha=0.7)
-    axes[1, 0].fill_between(range(len(errors_mid)), errors_mid, alpha=0.3)
-    axes[1, 0].set_xlabel('Sample Index', fontsize=11, fontweight='bold')
-    axes[1, 0].set_ylabel('Absolute Error (µm)', fontsize=11, fontweight='bold')
-    axes[1, 0].set_title('Mid-span Prediction Error', fontsize=12, fontweight='bold')
-    axes[1, 0].grid(True, alpha=0.3)
+    # Error curves
+    err_mid = np.abs(true_vals[:, 0] - pred_vals[:, 0])
+    axes[1, 0].plot(err_mid, color='blue', alpha=0.7)
+    axes[1, 0].fill_between(range(len(err_mid)), err_mid, alpha=0.3)
+    axes[1, 0].set_ylabel('Error (µm)', fontsize=11)
+    axes[1, 0].set_title('Mid-span Error', fontsize=12)
+    axes[1, 0].grid(alpha=0.3)
 
-    # 3/4-span errors
-    errors_3q = np.abs(true_values[:, 1] - predictions[:, 1])
-    axes[1, 1].plot(errors_3q, linewidth=1.5, color='orange', alpha=0.7)
-    axes[1, 1].fill_between(range(len(errors_3q)), errors_3q, alpha=0.3, color='orange')
-    axes[1, 1].set_xlabel('Sample Index', fontsize=11, fontweight='bold')
-    axes[1, 1].set_ylabel('Absolute Error (µm)', fontsize=11, fontweight='bold')
-    axes[1, 1].set_title('3/4-span Prediction Error', fontsize=12, fontweight='bold')
-    axes[1, 1].grid(True, alpha=0.3)
+    err_3q = np.abs(true_vals[:, 1] - pred_vals[:, 1])
+    axes[1, 1].plot(err_3q, color='orange', alpha=0.7)
+    axes[1, 1].fill_between(range(len(err_3q)), err_3q, alpha=0.3, color='orange')
+    axes[1, 1].set_ylabel('Error (µm)', fontsize=11)
+    axes[1, 1].set_title('3/4-span Error', fontsize=12)
+    axes[1, 1].grid(alpha=0.3)
 
-    plt.suptitle(title, fontsize=14, fontweight='bold', y=0.995)
+    plt.suptitle(title, fontsize=14, fontweight='bold')
     plt.tight_layout()
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved prediction plot to {save_path}")
-
+        print(f"Saved to {save_path}")
     plt.show()
 
     # Print metrics
-    mse_mid = np.mean((true_values[:, 0] - predictions[:, 0])**2)
-    mse_3q = np.mean((true_values[:, 1] - predictions[:, 1])**2)
-    mae_mid = np.mean(errors_mid)
-    mae_3q = np.mean(errors_3q)
-    rmse_mid = np.sqrt(mse_mid)
-    rmse_3q = np.sqrt(mse_3q)
+    mse_mid = np.mean((true_vals[:, 0] - pred_vals[:, 0])**2)
+    mse_3q = np.mean((true_vals[:, 1] - pred_vals[:, 1])**2)
+    mae_mid = np.mean(err_mid)
+    mae_3q = np.mean(err_3q)
 
-    print("\n" + "="*60)
-    print("PREDICTION METRICS")
-    print("="*60)
-    print(f"Mid-span (L/2):")
-    print(f"  MSE:  {mse_mid:.6e}")
-    print(f"  RMSE: {rmse_mid:.6e}")
-    print(f"  MAE:  {mae_mid:.6e}")
-    print(f"\n3/4-span (3L/4):")
-    print(f"  MSE:  {mse_3q:.6e}")
-    print(f"  RMSE: {rmse_3q:.6e}")
-    print(f"  MAE:  {mae_3q:.6e}")
-    print("="*60)
+    print("\n" + "="*50)
+    print("METRICS")
+    print("="*50)
+    print(f"Mid-span: MSE={mse_mid:.6e}, MAE={mae_mid:.6e}")
+    print(f"3/4-span: MSE={mse_3q:.6e}, MAE={mae_3q:.6e}")
+    print("="*50)
 
 
 def main():
-    """Main training pipeline"""
-
+    """Train LSTM ensemble models."""
     print("\n" + "="*70)
-    print("ENSEMBLE LSTM FOR MEMS BEAM DISPLACEMENT PREDICTION")
+    print("LSTM ENSEMBLE TRAINING - MEMS BEAM DISPLACEMENT")
     print("="*70)
 
     # Configuration
     data_dir = "D:/exportfiles"
-    batch_size = 16
-    epochs = 100
+    batch_size = 32
+    epochs = 80
     learning_rate = 0.001
-    sequence_length = 50
+    seq_len = 30
     stride = 10
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     results_dir = "./results"
 
-    print(f"\nUsing device: {device}")
+    print(f"\nDevice: {device}")
 
-    # 1. Load wave dataset
-    print("\n[1] Loading wave actuation data...")
-    wave_dataset = BeamDataset(data_dir, actuation_type='wave',
-                              sequence_length=sequence_length, stride=stride)
+    # Load datasets
+    print("\n[1] Loading wave data...")
+    wave_data = BeamDataset(data_dir, actuation_type='wave',
+                           sequence_length=seq_len, stride=stride)
+    print(f"    Loaded {len(wave_data)} samples")
 
-    if len(wave_dataset) == 0:
-        print("No wave data found. Skipping wave model training.")
-        wave_dataset = None
-    else:
-        print(f"Loaded {len(wave_dataset)} wave sequences")
+    print("\n[2] Loading step data...")
+    step_data = BeamDataset(data_dir, actuation_type='step',
+                           sequence_length=seq_len, stride=stride)
+    print(f"    Loaded {len(step_data)} samples")
 
-    # 2. Load step dataset
-    print("\n[2] Loading step actuation data...")
-    step_dataset = BeamDataset(data_dir, actuation_type='step',
-                              sequence_length=sequence_length, stride=stride)
-
-    if len(step_dataset) == 0:
-        print("No step data found. Skipping step model training.")
-        step_dataset = None
-    else:
-        print(f"Loaded {len(step_dataset)} step sequences")
-
-    if wave_dataset is None and step_dataset is None:
+    if len(wave_data) == 0 and len(step_data) == 0:
         print("ERROR: No data loaded!")
         return
 
-    # 3. Create ensemble
-    print("\n[3] Creating ensemble predictor...")
+    # Create ensemble
+    print("\n[3] Creating ensemble...")
     ensemble = EnsembleBeamPredictor()
     ensemble.create_models()
+    ensemble._input_scaler = None
+    ensemble._output_scaler = None
+    ensemble._geom_scaler = None
 
-    # 4. Train models
-    print("\n[4] Training models...")
+    # Training
+    print("\n[4] Training...")
+    pin_mem = device.type == 'cuda'
 
-    if wave_dataset is not None:
-        print("\n--- Training Wave Model ---")
-        train_size = int(0.7 * len(wave_dataset))
-        val_size = int(0.15 * len(wave_dataset))
-        test_size = len(wave_dataset) - train_size - val_size
+    # Train wave model
+    if len(wave_data) > 0:
+        print("\n--- Wave Model ---")
+        n = len(wave_data)
+        train_idx, val_idx, test_idx = int(0.7*n), int(0.15*n), n - int(0.7*n) - int(0.15*n)
 
-        train_wave, val_wave, test_wave = torch.utils.data.random_split(
-            wave_dataset, [train_size, val_size, test_size]
-        )
+        from torch.utils.data import random_split
+        train_w, val_w, test_w = random_split(wave_data, [train_idx, val_idx, test_idx])
 
-        train_loader_wave = DataLoader(train_wave, batch_size=batch_size, shuffle=True)
-        val_loader_wave = DataLoader(val_wave, batch_size=batch_size)
-        test_loader_wave = DataLoader(test_wave, batch_size=batch_size)
+        train_loader_w = DataLoader(train_w, batch_size=batch_size, shuffle=True, pin_memory=pin_mem)
+        val_loader_w = DataLoader(val_w, batch_size=batch_size, pin_memory=pin_mem)
+        test_loader_w = DataLoader(test_w, batch_size=batch_size, pin_memory=pin_mem)
 
-        train_losses_wave, val_losses_wave = ensemble.train_model(
-            'wave', train_loader_wave, val_loader_wave,
+        train_loss_w, val_loss_w = ensemble.train_model(
+            'wave', train_loader_w, val_loader_w,
             epochs=epochs, learning_rate=learning_rate, device=device
         )
 
-        # Test wave model
+        # Test
         print("\nTesting wave model...")
         model = ensemble.models['wave'].to(device)
         model.eval()
 
-        predictions_wave = []
-        targets_wave = []
-
+        pred_w, true_w = [], []
         with torch.no_grad():
-            for sequences, targets, features in test_loader_wave:
-                sequences = sequences.to(device)
-                features = features.to(device)
+            for seq, target, feat in test_loader_w:
+                seq = seq.to(device)
+                feat = feat.to(device)
+                out = model(seq, feat)
+                pred_w.append(out.cpu().numpy())
+                true_w.append(target.numpy())
 
-                outputs = model(sequences, features)
-                predictions_wave.append(outputs.cpu().numpy())
-                targets_wave.append(targets.numpy())
-
-        predictions_wave = np.vstack(predictions_wave)
-        targets_wave = np.vstack(targets_wave)
+        pred_w = np.vstack(pred_w)
+        true_w = np.vstack(true_w)
 
         # Denormalize
-        predictions_wave = wave_dataset.output_scaler.inverse_transform(predictions_wave)
-        targets_wave = wave_dataset.output_scaler.inverse_transform(targets_wave)
+        pred_w = wave_data.output_scaler.inverse_transform(pred_w)
+        true_w = wave_data.output_scaler.inverse_transform(true_w)
 
-        # Visualize
-        visualize_predictions(targets_wave, predictions_wave,
-                            title="Wave Actuation - Model Predictions",
-                            save_path=f"{results_dir}/wave_predictions.png")
-        visualize_training(train_losses_wave, val_losses_wave,
-                         title="Wave Model Training",
-                         save_path=f"{results_dir}/wave_training_curves.png")
+        ensemble._input_scaler = wave_data.input_scaler
+        ensemble._output_scaler = wave_data.output_scaler
+        ensemble._geom_scaler = wave_data.geom_scaler
 
-    if step_dataset is not None:
-        print("\n--- Training Step Model ---")
-        train_size = int(0.7 * len(step_dataset))
-        val_size = int(0.15 * len(step_dataset))
-        test_size = len(step_dataset) - train_size - val_size
+        plot_predictions(true_w, pred_w, "Wave - Predictions",
+                        f"{results_dir}/wave_pred.png")
+        plot_training(train_loss_w, val_loss_w, "Wave Training",
+                     f"{results_dir}/wave_train.png")
 
-        train_step, val_step, test_step = torch.utils.data.random_split(
-            step_dataset, [train_size, val_size, test_size]
-        )
+    # Train step model
+    if len(step_data) > 0:
+        print("\n--- Step Model ---")
+        n = len(step_data)
+        train_idx, val_idx, test_idx = int(0.7*n), int(0.15*n), n - int(0.7*n) - int(0.15*n)
 
-        train_loader_step = DataLoader(train_step, batch_size=batch_size, shuffle=True)
-        val_loader_step = DataLoader(val_step, batch_size=batch_size)
-        test_loader_step = DataLoader(test_step, batch_size=batch_size)
+        from torch.utils.data import random_split
+        train_s, val_s, test_s = random_split(step_data, [train_idx, val_idx, test_idx])
 
-        train_losses_step, val_losses_step = ensemble.train_model(
-            'step', train_loader_step, val_loader_step,
+        train_loader_s = DataLoader(train_s, batch_size=batch_size, shuffle=True, pin_memory=pin_mem)
+        val_loader_s = DataLoader(val_s, batch_size=batch_size, pin_memory=pin_mem)
+        test_loader_s = DataLoader(test_s, batch_size=batch_size, pin_memory=pin_mem)
+
+        train_loss_s, val_loss_s = ensemble.train_model(
+            'step', train_loader_s, val_loader_s,
             epochs=epochs, learning_rate=learning_rate, device=device
         )
 
-        # Test step model
+        # Test
         print("\nTesting step model...")
         model = ensemble.models['step'].to(device)
         model.eval()
 
-        predictions_step = []
-        targets_step = []
-
+        pred_s, true_s = [], []
         with torch.no_grad():
-            for sequences, targets, features in test_loader_step:
-                sequences = sequences.to(device)
-                features = features.to(device)
+            for seq, target, feat in test_loader_s:
+                seq = seq.to(device)
+                feat = feat.to(device)
+                out = model(seq, feat)
+                pred_s.append(out.cpu().numpy())
+                true_s.append(target.numpy())
 
-                outputs = model(sequences, features)
-                predictions_step.append(outputs.cpu().numpy())
-                targets_step.append(targets.numpy())
-
-        predictions_step = np.vstack(predictions_step)
-        targets_step = np.vstack(targets_step)
+        pred_s = np.vstack(pred_s)
+        true_s = np.vstack(true_s)
 
         # Denormalize
-        predictions_step = step_dataset.output_scaler.inverse_transform(predictions_step)
-        targets_step = step_dataset.output_scaler.inverse_transform(targets_step)
+        pred_s = step_data.output_scaler.inverse_transform(pred_s)
+        true_s = step_data.output_scaler.inverse_transform(true_s)
 
-        # Visualize
-        visualize_predictions(targets_step, predictions_step,
-                            title="Step Actuation - Model Predictions",
-                            save_path=f"{results_dir}/step_predictions.png")
-        visualize_training(train_losses_step, val_losses_step,
-                         title="Step Model Training",
-                         save_path=f"{results_dir}/step_training_curves.png")
+        if ensemble._input_scaler is None:
+            ensemble._input_scaler = step_data.input_scaler
+            ensemble._output_scaler = step_data.output_scaler
+            ensemble._geom_scaler = step_data.geom_scaler
 
-    # 5. Save models
+        plot_predictions(true_s, pred_s, "Step - Predictions",
+                        f"{results_dir}/step_pred.png")
+        plot_training(train_loss_s, val_loss_s, "Step Training",
+                     f"{results_dir}/step_train.png")
+
+    # Save
     print("\n[5] Saving models...")
     ensemble.save_models("./saved_models")
+    ensemble.save_scalers("./saved_models")
 
     print("\n" + "="*70)
-    print("Training completed successfully!")
+    print("Training complete!")
     print("="*70)
 
 
