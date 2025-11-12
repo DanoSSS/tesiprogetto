@@ -19,10 +19,9 @@ buildNumber.properties
 .ipynb_checkpoints
 anaconda_projects
 thesiswiki
-diary
 sample
 __pycache__/
 sessiontesipy.vim
 src/__pycache__/
-saved_models*
+saved_models
 results
